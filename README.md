@@ -43,18 +43,23 @@ plain-text **INI file** stored in the user's home directory.
 
 ## Installation
 
-### Traditional add-on (zip / .py file)
+The add-on is structured as a Python package so it is compatible with both
+the **Blender Extension system** (4.2+) and the **legacy add-on installer**.
 
-1. Download `create_tracked_cameras.py` (or the zipped release).
-2. In Blender: **Edit → Preferences → Add-ons → Install from File…**
-3. Select the downloaded file and click **Install Add-on**.
-4. Enable the add-on by ticking the checkbox next to *Create Tracked Cameras*.
+### Blender Extension — recommended (Blender 4.2+)
 
-### Blender Extension (Blender 4.2 +)
+1. Download the zipped release (the zip contains `__init__.py` and
+   `blender_manifest.toml` at the root).
+2. In Blender: **Edit → Preferences → Extensions → Install from Disk…**
+3. Select the zip file. Blender installs it under the name defined in the
+   manifest (`create_tracked_cameras`).
+
+### Legacy add-on installer (any Blender 5.0+ version)
 
 1. Download the zipped release.
-2. In Blender: **Edit → Preferences → Extensions → Install from Disk…**
-3. Select the zip file.
+2. In Blender: **Edit → Preferences → Add-ons → Install from File…**
+3. Select the zip file and click **Install Add-on**.
+4. Enable the add-on by ticking the checkbox next to *Create Tracked Cameras*.
 
 ---
 
