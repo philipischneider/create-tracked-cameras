@@ -177,4 +177,4 @@ and never reused within a session.
 
 ## License
 
-[MIT](LICENSE) — free to use, modify, and distribute.
+[GNU GPLv3](LICENSE) — free to use, modify, and distribute under GNU General Public License version 3.

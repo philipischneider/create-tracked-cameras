@@ -9,7 +9,7 @@ type          = "add-on"
 
 blender_version_min = "5.0.0"
 
-license  = ["SPDX:MIT"]
+license  = ["SPDX:GPL-3.0-or-later"]
 category = "camera"
 website  = "https://github.com/philipischneider/create-tracked-cameras"
 
