@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id            = "create_tracked_cameras"
+version       = "1.1.0"
+name          = "Create Tracked Cameras"
+tagline       = "One-click tracked camera rigs with Track To, Follow Path, and Depth of Field"
+maintainer    = "philipischneider"
+type          = "add-on"
+
+blender_version_min = "5.0.0"
+
+license  = ["SPDX:MIT"]
+category = "camera"
+website  = "https://github.com/philipischneider/create-tracked-cameras"
+
+[build]
+paths_exclude_pattern = [
+  "*.blend",
+  "*.blend1",
+  "__pycache__/",
+]
