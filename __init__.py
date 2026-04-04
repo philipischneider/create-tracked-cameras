@@ -311,6 +311,44 @@ def _next_camera_number() -> int:
     return n
 
 
+def _create_follow_path_animation(
+    obj: bpy.types.Object,
+    constraint_name: str,
+    frame_start: int,
+    frame_end: int,
+) -> None:
+    """
+    Create keyframes for a Follow Path constraint offset.
+
+    Args:
+        obj: The object with the Follow Path constraint
+        constraint_name: Name of the Follow Path constraint
+        frame_start: Frame where offset = 0
+        frame_end: Frame where offset = -100
+    """
+    # Ensure animation data exists
+    if obj.animation_data is None:
+        obj.animation_data_create()
+
+    # Insert keyframes at start and end
+    data_path = f'constraints["{constraint_name}"].offset'
+
+    # Frame start: offset = 0
+    obj.constraints[constraint_name].offset = 0.0
+    obj.keyframe_insert(data_path=data_path, frame=frame_start)
+
+    # Frame end: offset = -100
+    obj.constraints[constraint_name].offset = -100.0
+    obj.keyframe_insert(data_path=data_path, frame=frame_end)
+
+    # Set interpolation to LINEAR (Vector) for all keyframes
+    if obj.animation_data and obj.animation_data.action:
+        for fcurve in obj.animation_data.action.fcurves:
+            if fcurve.data_path == data_path:
+                for keyframe in fcurve.keyframe_points:
+                    keyframe.interpolation = "LINEAR"
+
+
 def _prepare_collection(n: int, prefs, context) -> bpy.types.Collection:
     """
     Return the collection that new objects should be linked to.
@@ -520,6 +558,25 @@ class OBJECT_OT_add_tracked_path_camera(Operator):
     )
     bl_options = {"REGISTER", "UNDO"}
 
+    # Animation properties
+    create_animation: BoolProperty(
+        name="Create Animation",
+        description="Automatically create keyframes for Follow Path offset",
+        default=False,
+    )
+    frame_start: FloatProperty(
+        name="Frame Start",
+        description="Start frame for animation (offset = 0)",
+        default=0.0,
+        precision=0,
+    )
+    frame_end: FloatProperty(
+        name="Frame End",
+        description="End frame for animation (offset = -100)",
+        default=100.0,
+        precision=0,
+    )
+
     def execute(self, context):
         addon = context.preferences.addons.get(ADDON_ID)
         if addon is None:
@@ -590,15 +647,25 @@ class OBJECT_OT_add_tracked_path_camera(Operator):
         track.track_axis = "TRACK_NEGATIVE_Z"
         track.up_axis    = "UP_Y"
 
+        # Create animation if requested
+        if self.create_animation:
+            _create_follow_path_animation(
+                cam_obj,
+                follow.name,
+                int(self.frame_start),
+                int(self.frame_end),
+            )
+
         # Leave camera selected and active
         for obj in context.selected_objects:
             obj.select_set(False)
         cam_obj.select_set(True)
         context.view_layer.objects.active = cam_obj
 
+        anim_status = " (with animation)" if self.create_animation else ""
         self.report(
             {"INFO"},
-            f"Created TCamera_{n} with Follow Path (r={radius:.4f}) "
+            f"Created TCamera_{n} with Follow Path (r={radius:.4f}){anim_status} "
             f"→ Target_Camera_{n} | DoF: DoF_Camera_{n} | Path: Path_TCamera_{n}",
         )
         return {"FINISHED"}
@@ -610,10 +677,29 @@ class OBJECT_OT_add_tracked_dual_path_camera(Operator):
     bl_idname = "object.add_tracked_dual_path_camera"
     bl_label = "Tracked Camera + Follow Path (Camera + Target)"
     bl_description = (
-        "Create a camera that follows a circle path and points at a target "
-        "that also follows a (smaller) circle path"
+        "Create a camera that follows a circle path, with DoF that follows a smaller path, "
+        "and points at a fixed target at the center"
     )
     bl_options = {"REGISTER", "UNDO"}
+
+    # Animation properties
+    create_animation: BoolProperty(
+        name="Create Animation",
+        description="Automatically create keyframes for Follow Path offsets",
+        default=False,
+    )
+    frame_start: FloatProperty(
+        name="Frame Start",
+        description="Start frame for animation (offset = 0)",
+        default=0.0,
+        precision=0,
+    )
+    frame_end: FloatProperty(
+        name="Frame End",
+        description="End frame for animation (offset = -100)",
+        default=100.0,
+        precision=0,
+    )
 
     def execute(self, context):
         addon = context.preferences.addons.get(ADDON_ID)
@@ -624,33 +710,41 @@ class OBJECT_OT_add_tracked_dual_path_camera(Operator):
         prefs           = addon.preferences
         target_size     = prefs.target_empty_size
         cam_size        = prefs.camera_display_size
+        dof_size        = prefs.dof_empty_size
         radius_camera   = prefs.circle_radius
-        radius_target   = prefs.target_circle_radius
+        radius_dof      = prefs.target_circle_radius
 
         n          = _next_camera_number()
         cursor_loc = Vector(context.scene.cursor.location)
 
         coll = _prepare_collection(n, prefs, context)
 
-        # Target empty — follows smaller circle path
+        # Target empty — fixed at cursor (center)
         target_obj = bpy.data.objects.new(f"Target_Camera_{n}", None)
         target_obj.empty_display_type = "PLAIN_AXES"
         target_obj.empty_display_size = target_size
-        target_obj.location           = Vector((0.0, 0.0, 0.0))
+        target_obj.location           = cursor_loc
         coll.objects.link(target_obj)
 
-        # Circle path for target
-        target_path_obj = _make_bezier_circle(
-            name=f"Path_Target_Camera_{n}",
-            radius=radius_target,
+        # DoF empty — follows smaller circle path
+        dof_obj = bpy.data.objects.new(f"DoF_Camera_{n}", None)
+        dof_obj.empty_display_type = "PLAIN_AXES"
+        dof_obj.empty_display_size = dof_size
+        dof_obj.location           = Vector((0.0, 0.0, 0.0))
+        coll.objects.link(dof_obj)
+
+        # Circle path for DoF empty
+        dof_path_obj = _make_bezier_circle(
+            name=f"Path_DoF_Camera_{n}",
+            radius=radius_dof,
             location=cursor_loc,
         )
-        coll.objects.link(target_path_obj)
+        coll.objects.link(dof_path_obj)
 
-        # Follow Path constraint for target
-        target_follow = target_obj.constraints.new(type="FOLLOW_PATH")
-        target_follow.target = target_path_obj
-        target_follow.use_curve_follow = False
+        # Follow Path constraint for DoF
+        dof_follow = dof_obj.constraints.new(type="FOLLOW_PATH")
+        dof_follow.target = dof_path_obj
+        dof_follow.use_curve_follow = False
 
         # Circle path for camera
         cam_path_obj = _make_bezier_circle(
@@ -664,7 +758,7 @@ class OBJECT_OT_add_tracked_dual_path_camera(Operator):
         cam_data              = bpy.data.cameras.new(f"TCamera_{n}")
         cam_data.display_size = cam_size
         cam_data.dof.use_dof      = True
-        cam_data.dof.focus_object = target_obj  # Focus on the orbiting target
+        cam_data.dof.focus_object = dof_obj  # Focus on the orbiting DoF empty
 
         cam_obj          = bpy.data.objects.new(f"TCamera_{n}", cam_data)
         cam_obj.location = Vector((0.0, 0.0, 0.0))
@@ -676,9 +770,24 @@ class OBJECT_OT_add_tracked_dual_path_camera(Operator):
         follow.use_curve_follow = False
 
         track            = cam_obj.constraints.new(type="TRACK_TO")
-        track.target     = target_obj
+        track.target     = target_obj  # Track to center
         track.track_axis = "TRACK_NEGATIVE_Z"
         track.up_axis    = "UP_Y"
+
+        # Create animation if requested
+        if self.create_animation:
+            _create_follow_path_animation(
+                cam_obj,
+                follow.name,
+                int(self.frame_start),
+                int(self.frame_end),
+            )
+            _create_follow_path_animation(
+                dof_obj,
+                dof_follow.name,
+                int(self.frame_start),
+                int(self.frame_end),
+            )
 
         # Leave camera selected and active
         for obj in context.selected_objects:
@@ -686,10 +795,12 @@ class OBJECT_OT_add_tracked_dual_path_camera(Operator):
         cam_obj.select_set(True)
         context.view_layer.objects.active = cam_obj
 
+        anim_status = " (with animation)" if self.create_animation else ""
         self.report(
             {"INFO"},
-            f"Created TCamera_{n} with dual circle paths "
-            f"→ Target_Camera_{n} | Paths: Path_TCamera_{n}, Path_Target_Camera_{n}",
+            f"Created TCamera_{n} with dual circle paths{anim_status} "
+            f"→ Target_Camera_{n} (center) | DoF: DoF_Camera_{n} | "
+            f"Paths: Path_TCamera_{n}, Path_DoF_Camera_{n}",
         )
         return {"FINISHED"}
 
@@ -731,6 +842,23 @@ class OBJECT_OT_add_tracked_spiral_camera(Operator):
         soft_max=1000.0,
         unit="LENGTH",
         precision=4,
+    )
+    create_animation: BoolProperty(
+        name="Create Animation",
+        description="Automatically create keyframes for Follow Path offset",
+        default=False,
+    )
+    frame_start: FloatProperty(
+        name="Frame Start",
+        description="Start frame for animation (offset = 0)",
+        default=0.0,
+        precision=0,
+    )
+    frame_end: FloatProperty(
+        name="Frame End",
+        description="End frame for animation (offset = -100)",
+        default=100.0,
+        precision=0,
     )
 
     def execute(self, context):
@@ -785,17 +913,27 @@ class OBJECT_OT_add_tracked_spiral_camera(Operator):
         track.track_axis = "TRACK_NEGATIVE_Z"
         track.up_axis    = "UP_Y"
 
+        # Create animation if requested
+        if self.create_animation:
+            _create_follow_path_animation(
+                cam_obj,
+                follow.name,
+                int(self.frame_start),
+                int(self.frame_end),
+            )
+
         # Leave camera selected and active
         for obj in context.selected_objects:
             obj.select_set(False)
         cam_obj.select_set(True)
         context.view_layer.objects.active = cam_obj
 
+        anim_status = " (with animation)" if self.create_animation else ""
         self.report(
             {"INFO"},
-            f"Created TCamera_{n} with spiral path "
+            f"Created TCamera_{n} with spiral path{anim_status} "
             f"(r: {self.radius_start:.4f} → {self.radius_end:.4f}, h={self.height:.4f}) "
-            f"→ Target_Camera_{n} | Path: Path_TCamera_{n}",
+            f"→ Target_Camera_{n} (center) | Path: Path_TCamera_{n}",
         )
         return {"FINISHED"}
 
@@ -806,8 +944,8 @@ class OBJECT_OT_add_tracked_dual_spiral_camera(Operator):
     bl_idname = "object.add_tracked_dual_spiral_camera"
     bl_label = "Tracked Camera + Spiral Follow Path (Camera + Target)"
     bl_description = (
-        "Create a camera that follows a spiral path and points at a target "
-        "that also follows a (smaller) spiral path"
+        "Create a camera that follows a spiral path, with DoF that follows a smaller spiral, "
+        "and points at a fixed target at the center"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -840,12 +978,29 @@ class OBJECT_OT_add_tracked_dual_spiral_camera(Operator):
         precision=4,
     )
     target_radius_ratio: FloatProperty(
-        name="Target Radius Ratio",
-        description="Target spiral radius as a fraction of camera spiral radius",
+        name="DoF Radius Ratio",
+        description="DoF spiral radius as a fraction of camera spiral radius",
         default=0.3,
         min=0.01,
         max=0.99,
         precision=2,
+    )
+    create_animation: BoolProperty(
+        name="Create Animation",
+        description="Automatically create keyframes for Follow Path offsets",
+        default=False,
+    )
+    frame_start: FloatProperty(
+        name="Frame Start",
+        description="Start frame for animation (offset = 0)",
+        default=0.0,
+        precision=0,
+    )
+    frame_end: FloatProperty(
+        name="Frame End",
+        description="End frame for animation (offset = -100)",
+        default=100.0,
+        precision=0,
     )
 
     def execute(self, context):
@@ -857,37 +1012,45 @@ class OBJECT_OT_add_tracked_dual_spiral_camera(Operator):
         prefs       = addon.preferences
         target_size = prefs.target_empty_size
         cam_size    = prefs.camera_display_size
+        dof_size    = prefs.dof_empty_size
 
         n          = _next_camera_number()
         cursor_loc = Vector(context.scene.cursor.location)
 
         coll = _prepare_collection(n, prefs, context)
 
-        # Target spiral radii (scaled by ratio)
-        target_radius_start = self.radius_start * self.target_radius_ratio
-        target_radius_end   = self.radius_end * self.target_radius_ratio
+        # DoF spiral radii (scaled by ratio)
+        dof_radius_start = self.radius_start * self.target_radius_ratio
+        dof_radius_end   = self.radius_end * self.target_radius_ratio
 
-        # Target empty — follows smaller spiral
+        # Target empty — fixed at cursor (center)
         target_obj = bpy.data.objects.new(f"Target_Camera_{n}", None)
         target_obj.empty_display_type = "PLAIN_AXES"
         target_obj.empty_display_size = target_size
-        target_obj.location           = Vector((0.0, 0.0, 0.0))
+        target_obj.location           = cursor_loc
         coll.objects.link(target_obj)
 
-        # Target spiral path
-        target_spiral_obj = _make_spiral_curve(
-            name=f"Path_Target_Camera_{n}",
-            radius_start=target_radius_start,
-            radius_end=target_radius_end,
+        # DoF empty — follows smaller spiral
+        dof_obj = bpy.data.objects.new(f"DoF_Camera_{n}", None)
+        dof_obj.empty_display_type = "PLAIN_AXES"
+        dof_obj.empty_display_size = dof_size
+        dof_obj.location           = Vector((0.0, 0.0, 0.0))
+        coll.objects.link(dof_obj)
+
+        # DoF spiral path
+        dof_spiral_obj = _make_spiral_curve(
+            name=f"Path_DoF_Camera_{n}",
+            radius_start=dof_radius_start,
+            radius_end=dof_radius_end,
             height=self.height,
             location=cursor_loc,
         )
-        coll.objects.link(target_spiral_obj)
+        coll.objects.link(dof_spiral_obj)
 
-        # Follow Path constraint for target
-        target_follow = target_obj.constraints.new(type="FOLLOW_PATH")
-        target_follow.target = target_spiral_obj
-        target_follow.use_curve_follow = False
+        # Follow Path constraint for DoF
+        dof_follow = dof_obj.constraints.new(type="FOLLOW_PATH")
+        dof_follow.target = dof_spiral_obj
+        dof_follow.use_curve_follow = False
 
         # Camera spiral path
         camera_spiral_obj = _make_spiral_curve(
@@ -903,7 +1066,7 @@ class OBJECT_OT_add_tracked_dual_spiral_camera(Operator):
         cam_data              = bpy.data.cameras.new(f"TCamera_{n}")
         cam_data.display_size = cam_size
         cam_data.dof.use_dof      = True
-        cam_data.dof.focus_object = target_obj
+        cam_data.dof.focus_object = dof_obj
 
         cam_obj          = bpy.data.objects.new(f"TCamera_{n}", cam_data)
         cam_obj.location = Vector((0.0, 0.0, 0.0))
@@ -915,9 +1078,24 @@ class OBJECT_OT_add_tracked_dual_spiral_camera(Operator):
         follow.use_curve_follow = False
 
         track            = cam_obj.constraints.new(type="TRACK_TO")
-        track.target     = target_obj
+        track.target     = target_obj  # Track to center
         track.track_axis = "TRACK_NEGATIVE_Z"
         track.up_axis    = "UP_Y"
+
+        # Create animation if requested
+        if self.create_animation:
+            _create_follow_path_animation(
+                cam_obj,
+                follow.name,
+                int(self.frame_start),
+                int(self.frame_end),
+            )
+            _create_follow_path_animation(
+                dof_obj,
+                dof_follow.name,
+                int(self.frame_start),
+                int(self.frame_end),
+            )
 
         # Leave camera selected and active
         for obj in context.selected_objects:
@@ -925,13 +1103,15 @@ class OBJECT_OT_add_tracked_dual_spiral_camera(Operator):
         cam_obj.select_set(True)
         context.view_layer.objects.active = cam_obj
 
+        anim_status = " (with animation)" if self.create_animation else ""
         self.report(
             {"INFO"},
-            f"Created TCamera_{n} with dual spiral paths "
+            f"Created TCamera_{n} with dual spiral paths{anim_status} "
             f"(camera r: {self.radius_start:.4f} → {self.radius_end:.4f}, "
-            f"target ratio: {self.target_radius_ratio:.2f}, "
+            f"dof ratio: {self.target_radius_ratio:.2f}, "
             f"h={self.height:.4f}) "
-            f"→ Target_Camera_{n} | Paths: Path_TCamera_{n}, Path_Target_Camera_{n}",
+            f"→ Target_Camera_{n} (center) | DoF: DoF_Camera_{n} | "
+            f"Paths: Path_TCamera_{n}, Path_DoF_Camera_{n}",
         )
         return {"FINISHED"}
 
