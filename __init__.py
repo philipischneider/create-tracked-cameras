@@ -57,6 +57,7 @@ _DEFAULTS = {
     "use_collection":      False,
     # Follow Path
     "circle_radius":       0.250,   # 250 mm
+    "target_circle_radius": 0.100,  # 100 mm (dual path camera)
 }
 
 # Float keys that are read/written as floats in the INI
@@ -66,6 +67,7 @@ _FLOAT_KEYS = (
     "dof_empty_size",
     "camera_distance",
     "circle_radius",
+    "target_circle_radius",
 )
 
 # Boolean keys in the INI
@@ -197,6 +199,16 @@ class CreateTrackedCamerasPreferences(AddonPreferences):
         precision=4,
     )
 
+    target_circle_radius: FloatProperty(
+        name="Target Circle Radius",
+        description="Radius of the target's circle path for Dual Path Camera",
+        default=_DEFAULTS["target_circle_radius"],
+        min=0.0001,
+        soft_max=1000.0,
+        unit="LENGTH",
+        precision=4,
+    )
+
     # ── Draw ───────────────────────────────────────────────────
 
     def draw(self, context):
@@ -231,7 +243,9 @@ class CreateTrackedCamerasPreferences(AddonPreferences):
         # Follow Path
         box = layout.box()
         box.label(text="Tracked Camera + Follow Path:", icon="CURVE_BEZCIRCLE")
-        box.prop(self, "circle_radius")
+        col = box.column(align=True)
+        col.prop(self, "circle_radius")
+        col.prop(self, "target_circle_radius")
 
         layout.separator()
 
@@ -256,6 +270,7 @@ class PREFERENCES_OT_ctc_save_ini(Operator):
             "camera_distance":     prefs.camera_distance,
             "use_collection":      prefs.use_collection,
             "circle_radius":       prefs.circle_radius,
+            "target_circle_radius": prefs.target_circle_radius,
         })
         self.report({"INFO"}, f"Saved → {get_ini_path()}")
         return {"FINISHED"}
@@ -275,6 +290,7 @@ class PREFERENCES_OT_ctc_load_ini(Operator):
         prefs.camera_distance     = values["camera_distance"]
         prefs.use_collection      = values["use_collection"]
         prefs.circle_radius       = values["circle_radius"]
+        prefs.target_circle_radius = values["target_circle_radius"]
         self.report({"INFO"}, f"Loaded ← {get_ini_path()}")
         return {"FINISHED"}
 
@@ -364,6 +380,56 @@ def _make_bezier_circle(name: str, radius: float, location: Vector) -> bpy.types
         bp.handle_right      = Vector(hr)
         bp.handle_left_type  = "FREE"
         bp.handle_right_type = "FREE"
+
+    obj          = bpy.data.objects.new(name, curve)
+    obj.location = location
+    return obj
+
+
+def _make_spiral_curve(
+    name: str,
+    radius_start: float,
+    radius_end: float,
+    height: float,
+    location: Vector,
+    n_points: int = 64
+) -> bpy.types.Object:
+    """
+    Build a spiral curve for one complete revolution (0° to 360°).
+
+    The spiral lies in an XY plane (varying Z) and is centred at *location*.
+    Points are sampled linearly; interpolation happens via POLY spline.
+
+    Args:
+        name: Object name
+        radius_start: Radius at t=0 (beginning)
+        radius_end: Radius at t=1 (end)
+        height: Z displacement over the full revolution
+        location: World position of spiral center
+        n_points: Number of control points (default 64)
+
+    Returns:
+        Spiral curve object positioned at location
+    """
+    curve = bpy.data.curves.new(name, type="CURVE")
+    curve.dimensions = "3D"
+    curve.resolution_u = 12  # Resolution for display
+
+    spline = curve.splines.new(type="POLY")
+    spline.points.add(n_points - 1)  # new() creates 1 point; add(n-1) → total n
+    spline.use_cyclic_u = False  # Open curve (not closed loop)
+
+    for i in range(n_points):
+        t = i / (n_points - 1)  # t: 0.0 → 1.0
+        angle = 2.0 * math.pi * t
+        radius = radius_start + (radius_end - radius_start) * t
+
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        z = height * t
+
+        # POLY spline uses .points (4D: x, y, z, w=1.0 for weight)
+        spline.points[i].co = (x, y, z, 1.0)
 
     obj          = bpy.data.objects.new(name, curve)
     obj.location = location
@@ -538,6 +604,338 @@ class OBJECT_OT_add_tracked_path_camera(Operator):
         return {"FINISHED"}
 
 
+# ── Operator: Tracked Camera + Follow Path (Dual Circle) ──────
+
+class OBJECT_OT_add_tracked_dual_path_camera(Operator):
+    bl_idname = "object.add_tracked_dual_path_camera"
+    bl_label = "Tracked Camera + Follow Path (Camera + Target)"
+    bl_description = (
+        "Create a camera that follows a circle path and points at a target "
+        "that also follows a (smaller) circle path"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        addon = context.preferences.addons.get(ADDON_ID)
+        if addon is None:
+            self.report({"ERROR"}, "Add-on preferences not found.")
+            return {"CANCELLED"}
+
+        prefs           = addon.preferences
+        target_size     = prefs.target_empty_size
+        cam_size        = prefs.camera_display_size
+        radius_camera   = prefs.circle_radius
+        radius_target   = prefs.target_circle_radius
+
+        n          = _next_camera_number()
+        cursor_loc = Vector(context.scene.cursor.location)
+
+        coll = _prepare_collection(n, prefs, context)
+
+        # Target empty — follows smaller circle path
+        target_obj = bpy.data.objects.new(f"Target_Camera_{n}", None)
+        target_obj.empty_display_type = "PLAIN_AXES"
+        target_obj.empty_display_size = target_size
+        target_obj.location           = Vector((0.0, 0.0, 0.0))
+        coll.objects.link(target_obj)
+
+        # Circle path for target
+        target_path_obj = _make_bezier_circle(
+            name=f"Path_Target_Camera_{n}",
+            radius=radius_target,
+            location=cursor_loc,
+        )
+        coll.objects.link(target_path_obj)
+
+        # Follow Path constraint for target
+        target_follow = target_obj.constraints.new(type="FOLLOW_PATH")
+        target_follow.target = target_path_obj
+        target_follow.use_curve_follow = False
+
+        # Circle path for camera
+        cam_path_obj = _make_bezier_circle(
+            name=f"Path_TCamera_{n}",
+            radius=radius_camera,
+            location=cursor_loc,
+        )
+        coll.objects.link(cam_path_obj)
+
+        # Camera
+        cam_data              = bpy.data.cameras.new(f"TCamera_{n}")
+        cam_data.display_size = cam_size
+        cam_data.dof.use_dof      = True
+        cam_data.dof.focus_object = target_obj  # Focus on the orbiting target
+
+        cam_obj          = bpy.data.objects.new(f"TCamera_{n}", cam_data)
+        cam_obj.location = Vector((0.0, 0.0, 0.0))
+        coll.objects.link(cam_obj)
+
+        # Constraints (order: Follow Path before Track To)
+        follow                  = cam_obj.constraints.new(type="FOLLOW_PATH")
+        follow.target           = cam_path_obj
+        follow.use_curve_follow = False
+
+        track            = cam_obj.constraints.new(type="TRACK_TO")
+        track.target     = target_obj
+        track.track_axis = "TRACK_NEGATIVE_Z"
+        track.up_axis    = "UP_Y"
+
+        # Leave camera selected and active
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        cam_obj.select_set(True)
+        context.view_layer.objects.active = cam_obj
+
+        self.report(
+            {"INFO"},
+            f"Created TCamera_{n} with dual circle paths "
+            f"→ Target_Camera_{n} | Paths: Path_TCamera_{n}, Path_Target_Camera_{n}",
+        )
+        return {"FINISHED"}
+
+
+# ── Operator: Tracked Camera + Spiral Follow Path ────────────
+
+class OBJECT_OT_add_tracked_spiral_camera(Operator):
+    bl_idname = "object.add_tracked_spiral_camera"
+    bl_label = "Tracked Camera + Spiral Follow Path"
+    bl_description = (
+        "Create a camera that follows a spiral path and points at a fixed target"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    # Operator properties (appear in F9 last-operator panel)
+    radius_start: FloatProperty(
+        name="Radius Start",
+        description="Starting radius of the spiral",
+        default=0.250,
+        min=0.0001,
+        soft_max=1000.0,
+        unit="LENGTH",
+        precision=4,
+    )
+    radius_end: FloatProperty(
+        name="Radius End",
+        description="Ending radius of the spiral",
+        default=0.100,
+        min=0.0001,
+        soft_max=1000.0,
+        unit="LENGTH",
+        precision=4,
+    )
+    height: FloatProperty(
+        name="Height",
+        description="Total vertical displacement over the spiral",
+        default=0.100,
+        min=0.0,
+        soft_max=1000.0,
+        unit="LENGTH",
+        precision=4,
+    )
+
+    def execute(self, context):
+        addon = context.preferences.addons.get(ADDON_ID)
+        if addon is None:
+            self.report({"ERROR"}, "Add-on preferences not found.")
+            return {"CANCELLED"}
+
+        prefs       = addon.preferences
+        target_size = prefs.target_empty_size
+        cam_size    = prefs.camera_display_size
+
+        n          = _next_camera_number()
+        cursor_loc = Vector(context.scene.cursor.location)
+
+        coll = _prepare_collection(n, prefs, context)
+
+        # Target empty — fixed at cursor
+        target_obj = bpy.data.objects.new(f"Target_Camera_{n}", None)
+        target_obj.empty_display_type = "PLAIN_AXES"
+        target_obj.empty_display_size = target_size
+        target_obj.location           = cursor_loc
+        coll.objects.link(target_obj)
+
+        # Spiral path
+        spiral_obj = _make_spiral_curve(
+            name=f"Path_TCamera_{n}",
+            radius_start=self.radius_start,
+            radius_end=self.radius_end,
+            height=self.height,
+            location=cursor_loc,
+        )
+        coll.objects.link(spiral_obj)
+
+        # Camera
+        cam_data              = bpy.data.cameras.new(f"TCamera_{n}")
+        cam_data.display_size = cam_size
+        cam_data.dof.use_dof      = True
+        cam_data.dof.focus_object = target_obj
+
+        cam_obj          = bpy.data.objects.new(f"TCamera_{n}", cam_data)
+        cam_obj.location = Vector((0.0, 0.0, 0.0))
+        coll.objects.link(cam_obj)
+
+        # Constraints
+        follow                  = cam_obj.constraints.new(type="FOLLOW_PATH")
+        follow.target           = spiral_obj
+        follow.use_curve_follow = False
+
+        track            = cam_obj.constraints.new(type="TRACK_TO")
+        track.target     = target_obj
+        track.track_axis = "TRACK_NEGATIVE_Z"
+        track.up_axis    = "UP_Y"
+
+        # Leave camera selected and active
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        cam_obj.select_set(True)
+        context.view_layer.objects.active = cam_obj
+
+        self.report(
+            {"INFO"},
+            f"Created TCamera_{n} with spiral path "
+            f"(r: {self.radius_start:.4f} → {self.radius_end:.4f}, h={self.height:.4f}) "
+            f"→ Target_Camera_{n} | Path: Path_TCamera_{n}",
+        )
+        return {"FINISHED"}
+
+
+# ── Operator: Tracked Camera + Dual Spiral Follow Path ────────
+
+class OBJECT_OT_add_tracked_dual_spiral_camera(Operator):
+    bl_idname = "object.add_tracked_dual_spiral_camera"
+    bl_label = "Tracked Camera + Spiral Follow Path (Camera + Target)"
+    bl_description = (
+        "Create a camera that follows a spiral path and points at a target "
+        "that also follows a (smaller) spiral path"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    # Operator properties
+    radius_start: FloatProperty(
+        name="Camera Radius Start",
+        description="Starting radius of the camera spiral",
+        default=0.250,
+        min=0.0001,
+        soft_max=1000.0,
+        unit="LENGTH",
+        precision=4,
+    )
+    radius_end: FloatProperty(
+        name="Camera Radius End",
+        description="Ending radius of the camera spiral",
+        default=0.100,
+        min=0.0001,
+        soft_max=1000.0,
+        unit="LENGTH",
+        precision=4,
+    )
+    height: FloatProperty(
+        name="Height",
+        description="Total vertical displacement over the spirals",
+        default=0.100,
+        min=0.0,
+        soft_max=1000.0,
+        unit="LENGTH",
+        precision=4,
+    )
+    target_radius_ratio: FloatProperty(
+        name="Target Radius Ratio",
+        description="Target spiral radius as a fraction of camera spiral radius",
+        default=0.3,
+        min=0.01,
+        max=0.99,
+        precision=2,
+    )
+
+    def execute(self, context):
+        addon = context.preferences.addons.get(ADDON_ID)
+        if addon is None:
+            self.report({"ERROR"}, "Add-on preferences not found.")
+            return {"CANCELLED"}
+
+        prefs       = addon.preferences
+        target_size = prefs.target_empty_size
+        cam_size    = prefs.camera_display_size
+
+        n          = _next_camera_number()
+        cursor_loc = Vector(context.scene.cursor.location)
+
+        coll = _prepare_collection(n, prefs, context)
+
+        # Target spiral radii (scaled by ratio)
+        target_radius_start = self.radius_start * self.target_radius_ratio
+        target_radius_end   = self.radius_end * self.target_radius_ratio
+
+        # Target empty — follows smaller spiral
+        target_obj = bpy.data.objects.new(f"Target_Camera_{n}", None)
+        target_obj.empty_display_type = "PLAIN_AXES"
+        target_obj.empty_display_size = target_size
+        target_obj.location           = Vector((0.0, 0.0, 0.0))
+        coll.objects.link(target_obj)
+
+        # Target spiral path
+        target_spiral_obj = _make_spiral_curve(
+            name=f"Path_Target_Camera_{n}",
+            radius_start=target_radius_start,
+            radius_end=target_radius_end,
+            height=self.height,
+            location=cursor_loc,
+        )
+        coll.objects.link(target_spiral_obj)
+
+        # Follow Path constraint for target
+        target_follow = target_obj.constraints.new(type="FOLLOW_PATH")
+        target_follow.target = target_spiral_obj
+        target_follow.use_curve_follow = False
+
+        # Camera spiral path
+        camera_spiral_obj = _make_spiral_curve(
+            name=f"Path_TCamera_{n}",
+            radius_start=self.radius_start,
+            radius_end=self.radius_end,
+            height=self.height,
+            location=cursor_loc,
+        )
+        coll.objects.link(camera_spiral_obj)
+
+        # Camera
+        cam_data              = bpy.data.cameras.new(f"TCamera_{n}")
+        cam_data.display_size = cam_size
+        cam_data.dof.use_dof      = True
+        cam_data.dof.focus_object = target_obj
+
+        cam_obj          = bpy.data.objects.new(f"TCamera_{n}", cam_data)
+        cam_obj.location = Vector((0.0, 0.0, 0.0))
+        coll.objects.link(cam_obj)
+
+        # Constraints
+        follow                  = cam_obj.constraints.new(type="FOLLOW_PATH")
+        follow.target           = camera_spiral_obj
+        follow.use_curve_follow = False
+
+        track            = cam_obj.constraints.new(type="TRACK_TO")
+        track.target     = target_obj
+        track.track_axis = "TRACK_NEGATIVE_Z"
+        track.up_axis    = "UP_Y"
+
+        # Leave camera selected and active
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        cam_obj.select_set(True)
+        context.view_layer.objects.active = cam_obj
+
+        self.report(
+            {"INFO"},
+            f"Created TCamera_{n} with dual spiral paths "
+            f"(camera r: {self.radius_start:.4f} → {self.radius_end:.4f}, "
+            f"target ratio: {self.target_radius_ratio:.2f}, "
+            f"h={self.height:.4f}) "
+            f"→ Target_Camera_{n} | Paths: Path_TCamera_{n}, Path_Target_Camera_{n}",
+        )
+        return {"FINISHED"}
+
+
 # ── Menu integration ──────────────────────────────────────────
 
 def _menu_func(self, context):
@@ -553,6 +951,21 @@ def _menu_func(self, context):
         text="Tracked Camera + Follow Path",
         icon="CAMERA_DATA",
     )
+    layout.operator(
+        OBJECT_OT_add_tracked_dual_path_camera.bl_idname,
+        text="Tracked Camera + Follow Path (Camera + Target)",
+        icon="CAMERA_DATA",
+    )
+    layout.operator(
+        OBJECT_OT_add_tracked_spiral_camera.bl_idname,
+        text="Tracked Camera + Spiral Follow Path",
+        icon="CAMERA_DATA",
+    )
+    layout.operator(
+        OBJECT_OT_add_tracked_dual_spiral_camera.bl_idname,
+        text="Tracked Camera + Spiral Follow Path (Camera + Target)",
+        icon="CAMERA_DATA",
+    )
 
 
 # ── Registration ──────────────────────────────────────────────
@@ -563,6 +976,9 @@ _classes = (
     PREFERENCES_OT_ctc_load_ini,
     OBJECT_OT_add_tracked_camera,
     OBJECT_OT_add_tracked_path_camera,
+    OBJECT_OT_add_tracked_dual_path_camera,
+    OBJECT_OT_add_tracked_spiral_camera,
+    OBJECT_OT_add_tracked_dual_spiral_camera,
 )
 
 
@@ -585,6 +1001,7 @@ def _load_prefs_from_ini_delayed():
         p.camera_distance     = values["camera_distance"]
         p.use_collection      = values["use_collection"]
         p.circle_radius       = values["circle_radius"]
+        p.target_circle_radius = values["target_circle_radius"]
     except Exception as exc:
         print(f"[CreateTrackedCameras] Could not load INI on startup: {exc}")
     return None
