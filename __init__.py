@@ -311,6 +311,36 @@ def _next_camera_number() -> int:
     return n
 
 
+def _iter_action_fcurves(obj: bpy.types.Object):
+    """
+    Yield all FCurves from the object's current action.
+
+    Supports both Blender 4.4+ slotted-action API (action.layers / channelbag)
+    and the legacy action.fcurves API used in earlier builds.
+    """
+    ad = obj.animation_data
+    if not ad or not ad.action:
+        return
+    action = ad.action
+
+    # Blender 4.4+ slotted-action API
+    if hasattr(action, "layers"):
+        slot = getattr(ad, "action_slot", None)
+        for layer in action.layers:
+            for strip in layer.strips:
+                try:
+                    cb = strip.channelbag(slot) if slot is not None else None
+                except (AttributeError, TypeError):
+                    cb = None
+                if cb is not None:
+                    yield from cb.fcurves
+        return
+
+    # Legacy API (Blender < 4.4)
+    if hasattr(action, "fcurves"):
+        yield from action.fcurves
+
+
 def _create_follow_path_animation(
     obj: bpy.types.Object,
     constraint_name: str,
@@ -330,7 +360,6 @@ def _create_follow_path_animation(
     if obj.animation_data is None:
         obj.animation_data_create()
 
-    # Insert keyframes at start and end
     data_path = f'constraints["{constraint_name}"].offset'
 
     # Frame start: offset = 0
@@ -341,12 +370,11 @@ def _create_follow_path_animation(
     obj.constraints[constraint_name].offset = -100.0
     obj.keyframe_insert(data_path=data_path, frame=frame_end)
 
-    # Set interpolation to LINEAR (Vector) for all keyframes
-    if obj.animation_data and obj.animation_data.action:
-        for fcurve in obj.animation_data.action.fcurves:
-            if fcurve.data_path == data_path:
-                for keyframe in fcurve.keyframe_points:
-                    keyframe.interpolation = "LINEAR"
+    # Set interpolation to LINEAR (Vector handles) for all inserted keyframes
+    for fcurve in _iter_action_fcurves(obj):
+        if fcurve.data_path == data_path:
+            for keyframe in fcurve.keyframe_points:
+                keyframe.interpolation = "LINEAR"
 
 
 def _prepare_collection(n: int, prefs, context) -> bpy.types.Collection:
